@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+
+# Script Name: dsctrl - downstream control
+# Description: A script to help downstream deployment on OpenShift Local
+# Usage: dsctrl <subcommand> [options] [arguments]
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Variables
+SCRIPT_NAME=$(basename "$0")
+VERSION="1.0.0"
+
+# Functions
+
+# Display help message
+usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME <subcommand> [options] [arguments]
+
+Subcommands:
+  start             Re/start OpenShift Local
+  build             Build downstream o-c image and manifests
+  deploy            Deploy o-c to OpenShift Local
+
+Options:
+  -h, --help        Show this help message and exit
+  -v, --version     Show script version and exit
+
+Run '$SCRIPT_NAME <subcommand> --help' for more information on a subcommand.
+EOF
+}
+
+start_usage() {
+      cat <<EOF
+Usage: $SCRIPT_NAME start [options] [arguments]
+
+Re/start your OpenShift Local instance. If an instance is already running, nothing will happen, unless otherwise
+specified.
+
+Options:
+  -c, --clean       Delete the current OpenShift Local instance and start fresh
+  -h, --help        Show this help message and exit
+  -v, --version     Show script version and exit
+
+Examples:
+
+# Start OpenShift Local is its not already started
+dsctr start
+
+# Nuke the existing instance (if there is one) and start a fresh instance
+dsctrl start --clean # or -c
+EOF
+}
+
+# Display script version
+version() {
+    echo "$SCRIPT_NAME version $VERSION"
+}
+
+# Echo a pretty error message
+pretty_error() {
+  echo -e "❗️ \033[31mError\033[0m: $1" >&2
+}
+
+# Start subcommand
+start() {
+    local FORCE_CLEAN=0
+    if [[ $# -gt 0 ]]; then
+      case "$1" in
+        -h|--help)
+            start_usage
+            exit 0
+            ;;
+        -v|--version)
+            version
+            exit 0
+            ;;
+        -c|--clean)
+            shift
+            FORCE_CLEAN=1
+            ;;
+        *)
+            pretty_error "unknown subcommand: $1"
+            echo -e "Run '$SCRIPT_NAME start -h' for more information." >&2
+            exit 1
+            ;;
+      esac
+    fi
+
+    echo -e "Starting OpenShift Local..."
+
+    # Check CRC is installed
+    if ! [ -x "$(command -v crc)" ]; then
+      pretty_error "CRC is not installed. Checkout: https://developers.redhat.com/products/openshift-local/overview"
+      exit 1
+    fi
+
+    # Blast CRC if necessary
+    if [ "${FORCE_CLEAN}" = 1 ]; then
+      echo -e "Deleting instance..."
+      crc delete --force > /dev/null
+      crc cleanup
+    fi
+
+    # Start CRC if necessary
+    if [ "$(crc status -o json | jq -r .success)" = "false"  ] || [ "$(crc status -o json | jq -r .crcStatus)" = "Stopped" ]; then
+        echo "Creating OpenShift Local instance"
+        crc setup
+        crc start
+    fi
+
+    # Check CRC started successfully
+    if ! [ "$(crc status -o json | jq -r .crcStatus)" = "Running" ]; then
+      pretty_error "CRC is unreachable. Please try recreating the cluster with the --clean option."
+      exit 1
+    fi
+
+    echo -e "🎉 OpenShift Local instance ready"
+    echo -e "kubeconfig=${HOME}/.crc/machines/crc/kubeconfig"
+}
+
+# Build subcommand
+build() {
+    # Set kubeconfig to CRC if necessary
+    export KUBECONFIG=${KUBECONFIG:-${HOME}/.crc/machines/crc/kubeconfig}
+    KUBE_ADMIN_USER=$(crc console --credentials -o json | jq -r .clusterConfig.adminCredentials.username)
+    KUBE_ADMIN_PASSWORD=$(crc console --credentials -o json | jq -r .clusterConfig.adminCredentials.password)
+
+    # login to crc
+    echo "Logging in as kubeadmin"
+    oc login -u "${KUBE_ADMIN_USER}" -p "${KUBE_ADMIN_PASSWORD}" > /dev/null
+
+    # Scale down CVO to stop changes from returning to stock configuration
+    echo "Scaling down CVO"
+    oc scale --replicas 0 -n openshift-cluster-version deployments/cluster-version-operator
+
+    echo "Allow cluster wide access to openshift repository"
+    oc policy add-role-to-group system:image-puller system:serviceaccounts --namespace=openshift
+
+    # push olm images to crc global repository
+    push_images olm:test opm:test
+
+    SKIP_MANIFESTS=${SKIP_MANIFESTS:-0}
+    if [ "${SKIP_MANIFESTS}" = 0 ]; then
+      # Create values and patches files
+      # Get images with the specific shas
+      OLM_IMG="$(oc get istag/olm:latest -o json | jq -r .image.dockerImageReference)"
+      OPM_IMG="$(oc get istag/opm:latest -o json | jq -r .image.dockerImageReference)"
+
+      make_manifest_patches "${OLM_IMG}" "${OPM_IMG}"
+
+      # Build e2e manifests
+      echo "Generating manifests"
+      # CRC_E2E_VALUES is already set in this script and exported
+      # If set, it will include the file referenced by it in the helm template command
+      # and update the manifests to use the locally built images
+      ./scripts/generate_crds_manifests.sh
+
+      # Apply patches
+      ${YQ} write --inplace -s scripts/psm-operator-deployment.crc.e2e.patch.yaml manifests/0000_50_olm_06-psm-operator.deployment.yaml
+      ${YQ} write --inplace -s scripts/collect-profiles.crc.e2e.patch.yaml manifests/0000_50_olm_07-collect-profiles.cronjob.yaml
+
+      echo "Deploying OLM"
+      find_flags=(-regex ".*\.yaml" -not -regex ".*\.removed\.yaml" -not -regex ".*\.ibm-cloud-managed\.yaml")
+
+      # Use the numbered ordering in the manifest file names to delete and deploy the manifests in order
+      echo "Replacing manifests"
+      find manifests "${find_flags[@]}" | sort | while read -r manifest; do
+        echo "Deleting ${manifest}"
+        set +e
+        kubectl replace -f "${manifest}"
+        set -e
+      done
+    fi
+
+    # Force recreation of olm pods
+    echo "Restarting OLM pods"
+    kubectl delete pod --all -n "${OLM_NAMESPACE}"
+
+    # Wait for deployments to be available
+    SKIP_WAIT_READY=${SKIP_WAIT_READY:-0}
+    if [ "${SKIP_WAIT_READY}" = 0 ]; then
+      echo "Waiting on deployments to be ready"
+      for DEPLOYMENT in $(oc get deployments --no-headers=true -n "${OLM_NAMESPACE}" | awk '{ print $1 }'); do
+        echo "Waiting for ${DEPLOYMENT}"
+        kubectl wait --for=condition=available --timeout=120s "deployment/${DEPLOYMENT}" -n "${OLM_NAMESPACE}"
+      done
+    fi
+
+    echo "Done"
+}
+
+# Deploy subcommand
+deploy() {
+    echo "Deploying the (downstream) operator-controller..."
+    # Set kubeconfig to CRC if necessary
+    export KUBECONFIG=${KUBECONFIG:-${HOME}/.crc/machines/crc/kubeconfig}
+    KUBE_ADMIN_USER=$(crc console --credentials -o json | jq -r .clusterConfig.adminCredentials.username)
+    KUBE_ADMIN_PASSWORD=$(crc console --credentials -o json | jq -r .clusterConfig.adminCredentials.password)
+
+    # login to crc
+    echo "Logging in as kubeadmin..."
+    oc login -u "${KUBE_ADMIN_USER}" -p "${KUBE_ADMIN_PASSWORD}" > /dev/null
+
+    # Scale down CVO to stop changes from returning to stock configuration
+    echo "Scaling down CVO..."
+    oc scale --replicas 0 -n openshift-cluster-version deployments/cluster-version-operator
+
+    echo "Allow cluster wide access to openshift repository..."
+    oc policy add-role-to-group system:image-puller system:serviceaccounts --namespace=openshift
+
+    # push olm images to crc global repository
+    push_images olm:test opm:test
+
+    SKIP_MANIFESTS=${SKIP_MANIFESTS:-0}
+    if [ "${SKIP_MANIFESTS}" = 0 ]; then
+      # Create values and patches files
+      # Get images with the specific shas
+      OLM_IMG="$(oc get istag/olm:latest -o json | jq -r .image.dockerImageReference)"
+      OPM_IMG="$(oc get istag/opm:latest -o json | jq -r .image.dockerImageReference)"
+
+      make_manifest_patches "${OLM_IMG}" "${OPM_IMG}"
+
+      # Build e2e manifests
+      echo "Generating manifests"
+      # CRC_E2E_VALUES is already set in this script and exported
+      # If set, it will include the file referenced by it in the helm template command
+      # and update the manifests to use the locally built images
+      ./scripts/generate_crds_manifests.sh
+
+      # Apply patches
+      ${YQ} write --inplace -s scripts/psm-operator-deployment.crc.e2e.patch.yaml manifests/0000_50_olm_06-psm-operator.deployment.yaml
+      ${YQ} write --inplace -s scripts/collect-profiles.crc.e2e.patch.yaml manifests/0000_50_olm_07-collect-profiles.cronjob.yaml
+
+      echo "Deploying OLM"
+      find_flags=(-regex ".*\.yaml" -not -regex ".*\.removed\.yaml" -not -regex ".*\.ibm-cloud-managed\.yaml")
+
+      # Use the numbered ordering in the manifest file names to delete and deploy the manifests in order
+      echo "Replacing manifests"
+      find manifests "${find_flags[@]}" | sort | while read -r manifest; do
+        echo "Deleting ${manifest}"
+        set +e
+        kubectl replace -f "${manifest}"
+        set -e
+      done
+    fi
+
+    # Force recreation of olm pods
+    echo "Restarting OLM pods"
+    kubectl delete pod --all -n "${OLM_NAMESPACE}"
+
+    # Wait for deployments to be available
+    SKIP_WAIT_READY=${SKIP_WAIT_READY:-0}
+    if [ "${SKIP_WAIT_READY}" = 0 ]; then
+      echo "Waiting on deployments to be ready"
+      for DEPLOYMENT in $(oc get deployments --no-headers=true -n "${OLM_NAMESPACE}" | awk '{ print $1 }'); do
+        echo "Waiting for ${DEPLOYMENT}"
+        kubectl wait --for=condition=available --timeout=120s "deployment/${DEPLOYMENT}" -n "${OLM_NAMESPACE}"
+      done
+    fi
+
+    echo "Done"
+}
+
+# Main script logic
+main() {
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 1
+    fi
+
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            version
+            exit 0
+            ;;
+        start)
+            shift
+            start "$@"
+            ;;
+        build)
+            shift
+            build "$@"
+            ;;
+        deploy)
+            shift
+            deploy "$@"
+            ;;
+        *)
+            echo -e "⚠️ \033[31mUnknown subcommand\033[0m: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+# Run the main function
+main "$@"
